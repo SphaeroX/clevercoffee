@@ -1,23 +1,26 @@
 /**
  * @file embeddedWebserver.h
  *
- * @brief Embedded webserver
- *
+ * @brief BLE-based connectivity layer replacing the legacy WiFi web server
  */
 
 #pragma once
 
 #include <Arduino.h>
-
-#include "FS.h"
-#include <AsyncTCP.h>
-#include <WiFi.h>
-
 #include <ArduinoJson.h>
-#include <ESPAsyncWebServer.h>
+#include <NimBLEDevice.h>
 
-#include "LittleFS.h"
+#include "Logger.h"
+#include "defaults.h"
+#include "userConfig.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <functional>
+#include <map>
+#include <string>
+#include <vector>
 
 enum EditableKind {
     kInteger,
@@ -33,495 +36,632 @@ struct editable_t {
         boolean hasHelpText;
         String helpText;
         EditableKind type;
-        int section;                // parameter section number
+        int section;
         int position;
-        std::function<bool()> show; // method that determines if we show this parameter (in the web interface)
+        std::function<bool()> show;
         int minValue;
         int maxValue;
-        void* ptr;                  // TODO: there must be a tidier way to do this? could we use c++ templates?
+        void* ptr;
 };
 
-AsyncWebServer server(80);
-AsyncEventSource events("/events");
-
-double curTemp = 0.0;
-double tTemp = 0.0;
-double hPower = 0.0;
-
-#define HISTORY_LENGTH 600 // 30 mins of values (20 vals/min * 60 min) = 600 (7,2kb)
-
-static float tempHistory[3][HISTORY_LENGTH] = {0};
-int historyCurrentIndex = 0;
-int historyValueCount = 0;
-
-void serverSetup();
-void setEepromWriteFcn(int (*fcnPtr)(void));
-
-// editable vars are specified in main.cpp
-#define EDITABLE_VARS_LEN 40
 extern std::map<String, editable_t> editableVars;
+extern const char* hostname;
 
-// EEPROM
-int (*writeToEeprom)(void) = NULL;
+void setEepromWriteFcn(int (*fcnPtr)(void));
+void serverSetup();
+void sendTempEvent(double currentTemp, double targetTemp, double heaterPower);
+bool bleIsConnected();
 
-void setEepromWriteFcn(int (*fcnPtr)(void)) {
-    writeToEeprom = fcnPtr;
+// Side-effect hooks implemented in main.cpp
+void setPidStatus(int status);
+void setSteamMode(int steamMode);
+void setBackflush(int backflush);
+#if FEATURE_SCALE == 1
+void setScaleTare(int tare);
+void setScaleCalibration(int calibration);
+#endif
+
+namespace EmbeddedBle {
+constexpr size_t HISTORY_LENGTH = 600;
+constexpr int SECONDS_TO_SKIP = 2;
+constexpr size_t kMaxChunkPayload = 96; // payload per BLE notification after metadata overhead
+
+inline double curTemp = 0.0;
+inline double tTemp = 0.0;
+inline double hPower = 0.0;
+inline float tempHistory[3][HISTORY_LENGTH] = {0};
+inline int historyCurrentIndex = 0;
+inline int historyValueCount = 0;
+inline int skippedValues = 0;
+
+inline NimBLEServer* g_server = nullptr;
+inline NimBLECharacteristic* g_txCharacteristic = nullptr;
+inline NimBLECharacteristic* g_rxCharacteristic = nullptr;
+inline bool g_clientConnected = false;
+inline int (*g_writeToEeprom)(void) = nullptr;
+
+inline const char* kServiceUuid = "b0c5c0ff-8123-4c5c-a63d-2f6f60adbb89";
+inline const char* kTxUuid = "b0c5c100-8123-4c5c-a63d-2f6f60adbb89";
+inline const char* kRxUuid = "b0c5c101-8123-4c5c-a63d-2f6f60adbb89";
+
+inline double round2(double value) {
+    return (int)(value * 100 + 0.5) / 100.0;
 }
 
-uint8_t flipUintValue(uint8_t value) {
-    return (value + 3) % 2;
-}
-
-String getTempString() {
-    StaticJsonDocument<96> doc;
-
-    doc["currentTemp"] = curTemp;
-    doc["targetTemp"] = tTemp;
-    doc["heaterPower"] = hPower;
-
-    String jsonTemps;
-    serializeJson(doc, jsonTemps);
-
-    return jsonTemps;
-}
-
-// proper modulo function (% is remainder, so will return negatives)
-int mod(int a, int b) {
+inline int mod(int a, int b) {
     int r = a % b;
     return r < 0 ? r + b : r;
 }
 
-// rounds a number to 2 decimal places
-// example: round(3.14159) -> 3.14
-// (less characters when serialized to json)
-double round2(double value) {
-    return (int)(value * 100 + 0.5) / 100.0;
+inline uint8_t flipUintValue(uint8_t value) {
+    return (value + 3) % 2;
 }
 
-String getValue(String varName) {
-    try {
-        editable_t e = editableVars.at(varName);
-        switch (e.type) {
-            case kFloat:
-                return String(*(float*)e.ptr);
-            case kDouble:
-                return String(*(double*)e.ptr);
-            case kDoubletime:
-                return String(*(double*)e.ptr);
-            case kInteger:
-                return String(*(int*)e.ptr);
-            case kUInt8:
-                return String(*(uint8_t*)e.ptr);
-            case kCString:
-                return String((char*)e.ptr);
-            default:
-                return F("Unknown type");
-                break;
+inline String levelToString(Logger::Level level) {
+    switch (level) {
+        case Logger::Level::TRACE:
+            return F("TRACE");
+        case Logger::Level::DEBUG:
+            return F("DEBUG");
+        case Logger::Level::INFO:
+            return F("INFO");
+        case Logger::Level::WARNING:
+            return F("WARNING");
+        case Logger::Level::ERROR:
+            return F("ERROR");
+        case Logger::Level::FATAL:
+            return F("FATAL");
+        default:
+            return F("SILENT");
+    }
+}
+
+inline void notifyJson(const DynamicJsonDocument& doc) {
+    if (!g_clientConnected || g_txCharacteristic == nullptr) {
+        return;
+    }
+
+    String requestId;
+    String command;
+
+    if (doc.containsKey("requestId")) requestId = doc["requestId"].as<String>();
+    if (doc.containsKey("command")) command = doc["command"].as<String>();
+
+    String payload;
+    serializeJson(doc, payload);
+
+    const size_t mtu = NimBLEDevice::getMTU();
+    const size_t maxDirect = (mtu > 3) ? mtu - 3 : 20;
+
+    if (payload.length() <= maxDirect) {
+        g_txCharacteristic->setValue(reinterpret_cast<const uint8_t*>(payload.c_str()), payload.length());
+        g_txCharacteristic->notify();
+        return;
+    }
+
+    size_t total = (payload.length() + kMaxChunkPayload - 1) / kMaxChunkPayload;
+
+    for (size_t index = 0; index < total; ++index) {
+        size_t start = index * kMaxChunkPayload;
+        size_t end = std::min(start + kMaxChunkPayload, static_cast<size_t>(payload.length()));
+        String slice = payload.substring(start, end);
+
+        DynamicJsonDocument chunkDoc(256 + slice.length());
+        chunkDoc["type"] = F("chunk");
+        if (!requestId.isEmpty()) chunkDoc["requestId"] = requestId;
+        if (!command.isEmpty()) chunkDoc["command"] = command;
+        chunkDoc["index"] = static_cast<uint32_t>(index);
+        chunkDoc["count"] = static_cast<uint32_t>(total);
+        chunkDoc["data"] = slice;
+
+        String chunk;
+        serializeJson(chunkDoc, chunk);
+        g_txCharacteristic->setValue(reinterpret_cast<const uint8_t*>(chunk.c_str()), chunk.length());
+        g_txCharacteristic->notify();
+        delay(4);
+    }
+}
+
+inline void sendError(const String& requestId, const char* command, const String& message) {
+    DynamicJsonDocument doc(256 + message.length());
+    doc["type"] = F("response");
+    doc["status"] = F("error");
+    doc["command"] = command;
+    if (!requestId.isEmpty()) doc["requestId"] = requestId;
+    doc["error"] = message;
+    notifyJson(doc);
+}
+
+inline void sendAck(const String& requestId, const char* command, const std::function<void(DynamicJsonDocument&)>& builder = nullptr) {
+    DynamicJsonDocument doc(256);
+    doc["type"] = F("response");
+    doc["status"] = F("ok");
+    doc["command"] = command;
+    if (!requestId.isEmpty()) doc["requestId"] = requestId;
+    if (builder) builder(doc);
+    notifyJson(doc);
+}
+
+inline void sendTextChunks(const char* type, const char* command, const String& requestId, const String& name, const String& text) {
+    if (text.length() == 0) {
+        DynamicJsonDocument doc(256);
+        doc["type"] = type;
+        doc["command"] = command;
+        if (!requestId.isEmpty()) doc["requestId"] = requestId;
+        if (!name.isEmpty()) doc["name"] = name;
+        doc["index"] = 0;
+        doc["more"] = false;
+        doc["text"] = "";
+        notifyJson(doc);
+        return;
+    }
+
+    size_t offset = 0;
+    uint32_t index = 0;
+
+    while (offset < static_cast<size_t>(text.length())) {
+        size_t end = std::min(offset + kMaxChunkPayload, static_cast<size_t>(text.length()));
+        String slice = text.substring(offset, end);
+
+        DynamicJsonDocument doc(256 + slice.length());
+        doc["type"] = type;
+        doc["command"] = command;
+        if (!requestId.isEmpty()) doc["requestId"] = requestId;
+        if (!name.isEmpty()) doc["name"] = name;
+        doc["index"] = index;
+        doc["more"] = end < static_cast<size_t>(text.length());
+        doc["text"] = slice;
+        notifyJson(doc);
+
+        offset = end;
+        ++index;
+    }
+}
+
+inline bool applyNumericValue(editable_t& entry, double numericValue, String& error) {
+    switch (entry.type) {
+        case kInteger: {
+            long val = static_cast<long>(std::lround(numericValue));
+            if (val < entry.minValue || val > entry.maxValue) {
+                error = F("value_out_of_range");
+                return false;
+            }
+            *(int*)entry.ptr = static_cast<int>(val);
+            return true;
         }
-    } catch (const std::out_of_range& exc) {
-        return "(unknown variable " + varName + ")";
-    }
-}
-
-void paramToJson(String name, editable_t& e, DynamicJsonDocument& doc) {
-    JsonObject paramObj = doc.createNestedObject();
-    paramObj["type"] = e.type;
-    paramObj["name"] = name;
-    paramObj["displayName"] = e.displayName;
-    paramObj["section"] = e.section;
-    paramObj["position"] = e.position;
-    paramObj["hasHelpText"] = e.hasHelpText;
-    paramObj["show"] = e.show();
-
-    // set parameter value
-    if (e.type == kInteger) {
-        paramObj["value"] = *(int*)e.ptr;
-    }
-    else if (e.type == kUInt8) {
-        paramObj["value"] = *(uint8_t*)e.ptr;
-    }
-    else if (e.type == kDouble || e.type == kDoubletime) {
-        paramObj["value"] = round2(*(double*)e.ptr);
-    }
-    else if (e.type == kFloat) {
-        paramObj["value"] = round2(*(float*)e.ptr);
-    }
-    else if (e.type == kCString) {
-        paramObj["value"] = (char*)e.ptr;
-    }
-
-    paramObj["min"] = e.minValue;
-    paramObj["max"] = e.maxValue;
-}
-
-// Use libraries for the webinterface from the internet (0) or from the local filesystem (1). 0 has slightly faster load times
-#define NOINTERNET 1
-
-// hash strings at compile time to use in switch statement
-// (from https://stackoverflow.com/questions/2111667/compile-time-string-hashing)
-constexpr unsigned int str2int(const char* str, int h = 0) {
-    return !str[h] ? 5381 : (str2int(str, h + 1) * 33) ^ str[h];
-}
-
-String getHeader(String varName) {
-    switch (str2int(varName.c_str())) {
-        case (str2int("FONTAWESOME")):
-#if NOINTERNET == 1
-            return F("<link href=\"/css/fontawesome-6.2.1.min.css\" rel=\"stylesheet\">");
-#else
-            return F("<link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.1/css/all.min.css\">");
-#endif
-        case (str2int("BOOTSTRAP")):
-#if NOINTERNET == 1
-            return F("<link href=\"/css/bootstrap-5.2.3.min.css\" rel=\"stylesheet\">");
-#else
-            return F("<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-rbsA2VBKQhggwzxH7pPCaAqO46MgnOM80zW1RWuH61DGLwZJEdK2Kadq2F9CUG65\" "
-                     "crossorigin=\"anonymous\">");
-#endif
-        case (str2int("BOOTSTRAP_BUNDLE")):
-#if NOINTERNET == 1
-            return F("<script src=\"/js/bootstrap.bundle.5.2.3.min.js\"></script>");
-#else
-            return F("<script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js\" integrity=\"sha384-kenU1KFdBIe4zVF0s0G1M5b4hcpxyD9F7jL+jjXkk+Q2h455rYXK/7HAuoJl+0I4\" "
-                     "crossorigin=\"anonymous\"></script>");
-#endif
-        case (str2int("VUEJS")):
-#if NOINTERNET == 1
-            return F("<script src=\"/js/vue.3.2.47.min.js\"></script>");
-#else
-            return F("<script src=\"https://cdn.jsdelivr.net/npm/vue@3.2.47/dist/vue.global.prod.min.js\"></script>");
-#endif
-        case (str2int("VUE_NUMBER_INPUT")):
-#if NOINTERNET == 1
-            return F("<script src=\"/js/vue-number-input.min.js\"></script>");
-#else
-            return F("<script src=\"https://unpkg.com/@chenfengyuan/vue-number-input@2.0.1/dist/vue-number-input.min.js\"></script>");
-#endif
-        case (str2int("UPLOT")):
-#if NOINTERNET == 1
-            return F("<script src=\"/js/uPlot.1.6.28.min.js\"></script><link rel=\"stylesheet\" href=\"/css/uPlot.min.css\">");
-#else
-            return F("<script src=\"https://cdn.jsdelivr.net/npm/uplot@1.6.28/dist/uPlot.iife.min.js\"></script><link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/uplot@1.6.24/dist/uPlot.min.css\">");
-#endif
-    }
-    return "";
-}
-
-String staticProcessor(const String& var) {
-    // try replacing var for variables in editableVars
-    if (var.startsWith("VAR_SHOW_")) {
-        return getValue(var.substring(9));   // cut off "VAR_SHOW_"
-    }
-    else if (var.startsWith("VAR_HEADER_")) {
-        return getHeader(var.substring(11)); // cut off "VAR_HEADER_"
-    }
-
-    // var didn't start with above names, try opening var as fragment file and use contents if it exists
-    // TODO: this seems to consume too much heap in some cases, probably better to remove fragment loading and only use one SPA in the long term (or only support ESP32 which has more RAM)
-    String varLower(var);
-    varLower.toLowerCase();
-
-    File file = LittleFS.open("/html_fragments/" + varLower + ".html", "r");
-
-    if (file) {
-        if (file.size() * 2 < ESP.getFreeHeap()) {
-            String ret = file.readString();
-            file.close();
-            return ret;
+        case kUInt8: {
+            long val = static_cast<long>(std::lround(numericValue));
+            if (val < entry.minValue || val > entry.maxValue) {
+                error = F("value_out_of_range");
+                return false;
+            }
+            *(uint8_t*)entry.ptr = static_cast<uint8_t>(val);
+            return true;
         }
-        else {
-            LOGF(DEBUG, "Can't open file %s, not enough memory available", file.name());
+        case kDouble:
+        case kDoubletime: {
+            if (numericValue < entry.minValue || numericValue > entry.maxValue) {
+                error = F("value_out_of_range");
+                return false;
+            }
+            *(double*)entry.ptr = numericValue;
+            return true;
+        }
+        case kFloat: {
+            if (numericValue < entry.minValue || numericValue > entry.maxValue) {
+                error = F("value_out_of_range");
+                return false;
+            }
+            *(float*)entry.ptr = static_cast<float>(numericValue);
+            return true;
+        }
+        case kCString:
+            error = F("read_only");
+            return false;
+    }
+
+    error = F("unknown_type");
+    return false;
+}
+
+inline void handleParameterSideEffects(const String& name, editable_t& entry) {
+    if (name == F("PID_ON")) {
+        setPidStatus(*(uint8_t*)entry.ptr);
+    }
+    else if (name == F("STEAM_MODE")) {
+        setSteamMode(*(uint8_t*)entry.ptr);
+    }
+    else if (name == F("BACKFLUSH_ON")) {
+        setBackflush(*(uint8_t*)entry.ptr);
+    }
+#if FEATURE_SCALE == 1
+    else if (name == F("TARE_ON")) {
+        setScaleTare(*(uint8_t*)entry.ptr);
+    }
+    else if (name == F("CALIBRATION_ON")) {
+        setScaleCalibration(*(uint8_t*)entry.ptr);
+    }
+#endif
+}
+
+inline bool setParameterValue(const String& name, const JsonVariantConst& value, String& error) {
+    auto it = editableVars.find(name);
+    if (it == editableVars.end()) {
+        error = F("unknown_parameter");
+        return false;
+    }
+
+    editable_t& entry = it->second;
+
+    if (entry.type == kCString) {
+        error = F("read_only");
+        return false;
+    }
+
+    double numeric = NAN;
+
+    if (value.is<double>() || value.is<float>() || value.is<long>() || value.is<int>()) {
+        numeric = value.as<double>();
+    }
+    else if (value.is<bool>()) {
+        numeric = value.as<bool>() ? 1.0 : 0.0;
+    }
+    else if (value.is<const char*>()) {
+        const char* raw = value.as<const char*>();
+        if (raw == nullptr || strlen(raw) == 0) {
+            error = F("empty_value");
+            return false;
+        }
+        char* end = nullptr;
+        numeric = strtod(raw, &end);
+        if (end == raw || (end && *end != '\0')) {
+            error = F("invalid_number");
+            return false;
+        }
+    }
+    else if (!value.isNull()) {
+        String raw = value.as<String>();
+        if (raw.length() == 0) {
+            error = F("empty_value");
+            return false;
+        }
+        char* end = nullptr;
+        numeric = strtod(raw.c_str(), &end);
+        if (end == raw.c_str() || (end && *end != '\0')) {
+            error = F("invalid_number");
+            return false;
         }
     }
     else {
-        LOGF(DEBUG, "Fragment %s not found", varLower.c_str());
+        error = F("missing_value");
+        return false;
     }
 
-    // didn't find a value for the var, replace var with empty string
-    return String();
+    if (std::isnan(numeric)) {
+        error = F("invalid_number");
+        return false;
+    }
+
+    if (!applyNumericValue(entry, numeric, error)) {
+        return false;
+    }
+
+    handleParameterSideEffects(name, entry);
+    return true;
 }
 
-void serverSetup() {
-    // set up dynamic routes (endpoints)
+inline void sendParameterSnapshot(const String& requestId, const char* command, const String& name, editable_t& entry) {
+    DynamicJsonDocument doc(384);
+    doc["type"] = F("parameter");
+    doc["command"] = command;
+    if (!requestId.isEmpty()) doc["requestId"] = requestId;
+    doc["name"] = name;
+    doc["label"] = entry.displayName;
+    doc["section"] = entry.section;
+    doc["position"] = entry.position;
+    doc["show"] = entry.show();
+    doc["hasHelp"] = entry.hasHelpText;
+    doc["min"] = entry.minValue;
+    doc["max"] = entry.maxValue;
 
-    server.on("/toggleSteam", HTTP_POST, [](AsyncWebServerRequest* request) {
-        int steam = flipUintValue(steamON);
+    switch (entry.type) {
+        case kInteger:
+            doc["value"] = *(int*)entry.ptr;
+            break;
+        case kUInt8:
+            doc["value"] = *(uint8_t*)entry.ptr;
+            break;
+        case kDouble:
+        case kDoubletime:
+            doc["value"] = round2(*(double*)entry.ptr);
+            break;
+        case kFloat:
+            doc["value"] = round2(*(float*)entry.ptr);
+            break;
+        case kCString:
+            doc["value"] = (const char*)entry.ptr;
+            break;
+    }
 
-        setSteamMode(steam);
-        LOGF(DEBUG, "Toggle steam mode: %i", steam);
+    notifyJson(doc);
+}
 
-        request->redirect("/");
-    });
+class ServerCallbacks : public NimBLEServerCallbacks {
+        void onConnect(NimBLEServer* pServer) override {
+            g_clientConnected = true;
+        }
 
-    server.on("/togglePid", HTTP_POST, [](AsyncWebServerRequest* request) {
-        LOGF(DEBUG, "/togglePid requested, method: %d", request->method());
-        int status = flipUintValue(pidON);
+        void onDisconnect(NimBLEServer* pServer) override {
+            g_clientConnected = false;
+            NimBLEDevice::startAdvertising();
+        }
+};
 
-        setPidStatus(status);
-        LOGF(DEBUG, "Toggle PID state: %d\n", status);
-
-        request->redirect("/");
-    });
-
-    server.on("/toggleBackflush", HTTP_POST, [](AsyncWebServerRequest* request) {
-        int backflush = flipUintValue(backflushOn);
-
-        setBackflush(backflush);
-        LOGF(DEBUG, "Toggle backflush mode: %i", backflush);
-
-        request->redirect("/");
-    });
-
-#if FEATURE_SCALE == 1
-    server.on("/toggleTareScale", HTTP_POST, [](AsyncWebServerRequest* request) {
-        int tare = flipUintValue(scaleTareOn);
-
-        setScaleTare(tare);
-        LOGF(DEBUG, "Toggle scale tare mode: %i", tare);
-
-        request->redirect("/");
-    });
-
-    server.on("/toggleScaleCalibration", HTTP_POST, [](AsyncWebServerRequest* request) {
-        int scaleCalibrate = flipUintValue(scaleCalibrationOn);
-
-        setScaleCalibration(scaleCalibrate);
-        LOGF(DEBUG, "Toggle scale calibration mode: %i", scaleCalibrate);
-
-        request->redirect("/");
-    });
-#endif
-
-    server.on("/parameters", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest* request) {
-        // Determine the size of the document to allocate based on the number
-        // of parameters
-        // GET = either
-        int requestParams = request->params();
-        int docLength = EDITABLE_VARS_LEN;
-
-        if (request->method() == 1) {
-            if (requestParams > 0) {
-                docLength = std::min(requestParams, EDITABLE_VARS_LEN);
+class CommandCallbacks : public NimBLECharacteristicCallbacks {
+        void onWrite(NimBLECharacteristic* characteristic) override {
+            std::string raw = characteristic->getValue();
+            if (raw.empty()) {
+                return;
             }
-        }
-        else if (request->method() == 2) {
-            docLength = std::min(requestParams, EDITABLE_VARS_LEN);
-        }
 
-        DynamicJsonDocument doc(JSON_ARRAY_SIZE(EDITABLE_VARS_LEN)                // array EDITABLE_VARS_LEN with parameters
-                                + JSON_OBJECT_SIZE(9) * EDITABLE_VARS_LEN         // object with 9 values per parameter
-                                + JSON_STRING_SIZE(25 + 30) * EDITABLE_VARS_LEN); // string size for templateString and displayName
+            DynamicJsonDocument doc(2048);
+            DeserializationError err = deserializeJson(doc, raw);
 
-        if (request->method() == 2) {                                             // method() returns values from WebRequestMethod enum -> 2 == HTTP_POST
-            // returns values from WebRequestMethod enum -> 2 == HTTP_POST
-            // update all given params and match var name in editableVars
+            String requestId;
+            const char* commandPtr = "unknown";
 
-            for (int i = 0; i < requestParams; i++) {
-                auto* p = request->getParam(i);
-                String varName;
+            if (doc.containsKey("requestId")) {
+                requestId = doc["requestId"].as<String>();
+            }
 
-                if (p->name().startsWith("var")) {
-                    varName = p->name().substring(3);
+            if (doc.containsKey("cmd")) {
+                commandPtr = doc["cmd"].as<const char*>();
+            }
+            else if (doc.containsKey("command")) {
+                commandPtr = doc["command"].as<const char*>();
+            }
+
+            if (err) {
+                sendError(requestId, commandPtr, String(F("invalid_json: ")) + err.c_str());
+                return;
+            }
+
+            String command(commandPtr);
+
+            auto commitIfNeeded = [&](bool changed) {
+                if (changed && g_writeToEeprom) {
+                    g_writeToEeprom();
+                }
+            };
+
+            if (command == F("ping")) {
+                sendAck(requestId, commandPtr, [](DynamicJsonDocument& d) { d["message"] = F("pong"); });
+            }
+            else if (command == F("get_temperatures")) {
+                sendAck(requestId, commandPtr, [](DynamicJsonDocument& d) {
+                    d["current"] = round2(curTemp);
+                    d["target"] = round2(tTemp);
+                    d["power"] = round2(hPower);
+                });
+            }
+            else if (command == F("get_parameters")) {
+                if (doc.containsKey("names")) {
+                    JsonArrayConst names = doc["names"].as<JsonArrayConst>();
+                    for (JsonVariantConst nameVariant : names) {
+                        String parameterName = nameVariant.as<String>();
+                        auto it = editableVars.find(parameterName);
+                        if (it != editableVars.end()) {
+                            sendParameterSnapshot(requestId, commandPtr, parameterName, it->second);
+                        }
+                    }
                 }
                 else {
-                    varName = p->name();
+                    for (auto& pair : editableVars) {
+                        sendParameterSnapshot(requestId, commandPtr, pair.first, pair.second);
+                    }
                 }
 
-                try {
-                    editable_t e = editableVars.at(varName);
-
-                    if (e.type == kInteger) {
-                        int newVal = atoi(p->value().c_str());
-                        *(int*)e.ptr = newVal;
-                    }
-                    else if (e.type == kUInt8) {
-                        *(uint8_t*)e.ptr = (uint8_t)atoi(p->value().c_str());
-                    }
-                    else if (e.type == kDouble || e.type == kDoubletime) {
-                        float newVal = atof(p->value().c_str());
-                        *(double*)e.ptr = newVal;
-                    }
-                    else if (e.type == kFloat) {
-                        float newVal = atof(p->value().c_str());
-                        *(float*)e.ptr = newVal;
-                    }
-
-                    paramToJson(varName, e, doc);
-                } catch (const std::out_of_range& exc) {
-                    continue;
-                }
+                sendAck(requestId, commandPtr);
             }
+            else if (command == F("get_parameter_help")) {
+                const char* name = doc["name"] | doc["parameter"] | "";
+                if (strlen(name) == 0) {
+                    sendError(requestId, commandPtr, F("missing_parameter"));
+                    return;
+                }
 
-            String paramsJson;
-            serializeJson(doc, paramsJson);
-            request->send(200, "application/json", paramsJson);
+                auto it = editableVars.find(name);
+                if (it == editableVars.end()) {
+                    sendError(requestId, commandPtr, F("unknown_parameter"));
+                    return;
+                }
 
-            // Write to EEPROM
-            if (writeToEeprom) {
-                if (writeToEeprom() == 0) {
-                    LOG(DEBUG, "successfully wrote EEPROM");
+                sendTextChunks("help", commandPtr, requestId, it->second.displayName, it->second.helpText);
+            }
+            else if (command == F("set_parameter")) {
+                const char* name = doc["name"] | doc["parameter"] | "";
+                if (strlen(name) == 0) {
+                    sendError(requestId, commandPtr, F("missing_parameter"));
+                    return;
+                }
+
+                String error;
+                if (!setParameterValue(name, doc["value"], error)) {
+                    sendError(requestId, commandPtr, error);
+                    return;
+                }
+
+                commitIfNeeded(true);
+
+                sendAck(requestId, commandPtr, [&](DynamicJsonDocument& resp) {
+                    editable_t& entry = editableVars.at(name);
+                    resp["name"] = name;
+                    switch (entry.type) {
+                        case kInteger:
+                            resp["value"] = *(int*)entry.ptr;
+                            break;
+                        case kUInt8:
+                            resp["value"] = *(uint8_t*)entry.ptr;
+                            break;
+                        case kDouble:
+                        case kDoubletime:
+                            resp["value"] = round2(*(double*)entry.ptr);
+                            break;
+                        case kFloat:
+                            resp["value"] = round2(*(float*)entry.ptr);
+                            break;
+                        case kCString:
+                            resp["value"] = (const char*)entry.ptr;
+                            break;
+                    }
+                });
+            }
+            else if (command == F("set_parameters")) {
+                if (!doc.containsKey("items")) {
+                    sendError(requestId, commandPtr, F("missing_items"));
+                    return;
+                }
+
+                JsonArray items = doc["items"].as<JsonArray>();
+                std::vector<String> updated;
+
+                for (JsonVariant item : items) {
+                    const char* name = item["name"] | "";
+                    if (strlen(name) == 0) {
+                        continue;
+                    }
+
+                    String error;
+                    if (setParameterValue(name, item["value"], error)) {
+                        updated.emplace_back(name);
+                    }
+                }
+
+                commitIfNeeded(!updated.empty());
+
+                sendAck(requestId, commandPtr, [&](DynamicJsonDocument& resp) {
+                    JsonArray changed = resp.createNestedArray("updated");
+                    for (const String& name : updated) {
+                        changed.add(name);
+                    }
+                });
+            }
+            else if (command == F("factory_reset")) {
+                if (factoryReset() == 0) {
+                    sendAck(requestId, commandPtr);
                 }
                 else {
-                    LOG(ERROR, "EEPROM write failed");
+                    sendError(requestId, commandPtr, F("factory_reset_failed"));
                 }
             }
+            else if (command == F("log_level")) {
+                const char* levelName = doc["level"] | "";
+                if (strlen(levelName) == 0) {
+                    sendError(requestId, commandPtr, F("missing_level"));
+                    return;
+                }
 
-            // Write the new values to MQTT
-            writeSysParamsToMQTT(true);    // Continue on error
-        }
-        else if (request->method() == 1) { // WebRequestMethod enum -> HTTP_GET
-            // get parameter id from first parameter, e.g. /parameters?param=PID_ON
-            int paramCount = request->params();
-            String paramId = paramCount > 0 ? request->getParam(0)->value() : "";
+                String lvl(levelName);
+                lvl.toUpperCase();
 
-            std::map<String, editable_t>::iterator it;
+                if (lvl == F("TRACE")) Logger::setLevel(Logger::Level::TRACE);
+                else if (lvl == F("DEBUG")) Logger::setLevel(Logger::Level::DEBUG);
+                else if (lvl == F("INFO")) Logger::setLevel(Logger::Level::INFO);
+                else if (lvl == F("WARNING")) Logger::setLevel(Logger::Level::WARNING);
+                else if (lvl == F("ERROR")) Logger::setLevel(Logger::Level::ERROR);
+                else if (lvl == F("FATAL")) Logger::setLevel(Logger::Level::FATAL);
+                else {
+                    sendError(requestId, commandPtr, F("invalid_level"));
+                    return;
+                }
 
-            if (!paramId.isEmpty()) {
-                it = editableVars.find(paramId);
+                sendAck(requestId, commandPtr);
             }
             else {
-                it = editableVars.begin();
-            }
-
-            for (; it != editableVars.end(); it++) {
-                editable_t e = it->second;
-                paramToJson(it->first, e, doc);
-
-                if (!paramId.isEmpty()) {
-                    break;
-                }
+                sendError(requestId, commandPtr, F("unknown_command"));
             }
         }
+};
 
-        if (doc.size() == 0) {
-            request->send(404, "application/json",
-                          F("{ \"code\": 404, \"message\": "
-                            "\"Parameter not found\"}"));
-            return;
-        }
+inline void sendLogMessage(Logger::Level level, const String& message) {
+    if (!g_clientConnected || g_txCharacteristic == nullptr) {
+        return;
+    }
 
-        String paramsJson;
-        serializeJson(doc, paramsJson);
-        request->send(200, "application/json", paramsJson);
-    });
-
-    server.on("/parameterHelp", HTTP_GET, [](AsyncWebServerRequest* request) {
-        DynamicJsonDocument doc(1024);
-        auto* p = request->getParam(0);
-
-        if (p == NULL) {
-            request->send(422, "text/plain", "parameter is missing");
-            return;
-        }
-
-        const String& varValue = p->value();
-
-        try {
-            editable_t e = editableVars.at(varValue);
-            doc["name"] = varValue;
-            doc["helpText"] = e.helpText;
-        } catch (const std::out_of_range& exc) {
-            request->send(404, "application/json", "parameter not found");
-            return;
-        }
-
-        String helpJson;
-        serializeJson(doc, helpJson);
-        request->send(200, "application/json", helpJson);
-    });
-
-    server.on("/temperatures", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = getTempString();
-        request->send(200, "application/json", json);
-    });
-
-    // TODO: could send values also chunked and without json (but needs three
-    // endpoints then?)
-    // https://stackoverflow.com/questions/61559745/espasyncwebserver-serve-large-array-from-ram
-    server.on("/timeseries", HTTP_GET, [](AsyncWebServerRequest* request) {
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-
-        // set capacity of json doc for history structure
-        DynamicJsonDocument doc(JSON_ARRAY_SIZE(2) + JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(HISTORY_LENGTH) * 3);
-
-        // for each value in mem history array, add json array element
-        JsonArray currentTemps = doc.createNestedArray("currentTemps");
-        JsonArray targetTemps = doc.createNestedArray("targetTemps");
-        JsonArray heaterPowers = doc.createNestedArray("heaterPowers");
-
-        // go through history values backwards starting from currentIndex and
-        // wrap around beginning to include valueCount many values
-        for (int i = mod(historyCurrentIndex - historyValueCount, HISTORY_LENGTH); i != mod(historyCurrentIndex, HISTORY_LENGTH); i = mod(i + 1, HISTORY_LENGTH)) {
-            currentTemps.add(round2(tempHistory[0][i]));
-            targetTemps.add(round2(tempHistory[1][i]));
-            heaterPowers.add(round2(tempHistory[2][i]));
-        }
-
-        serializeJson(doc, *response);
-        request->send(response);
-    });
-
-    server.on("/wifireset", HTTP_POST, [](AsyncWebServerRequest* request) {
-        request->send(200, "text/plain", "WiFi settings are being reset. Rebooting...");
-
-        // Defer slightly so the response gets sent before reboot
-        delay(1000);
-
-        wiFiReset();
-    });
-
-    server.onNotFound([](AsyncWebServerRequest* request) { request->send(404, "text/plain", "Not found"); });
-
-    // set up event handler for temperature messages
-    events.onConnect([](AsyncEventSourceClient* client) {
-        if (client->lastId()) {
-            LOGF(DEBUG, "Reconnected, last message ID was: %u", client->lastId());
-        }
-
-        client->send("hello", NULL, millis(), 10000);
-    });
-
-    server.addHandler(&events);
-
-    // serve static files
-    LittleFS.begin();
-    server.serveStatic("/css", LittleFS, "/css/", "max-age=604800"); // cache for one week
-    server.serveStatic("/js", LittleFS, "/js/", "max-age=604800");
-    server.serveStatic("/img", LittleFS, "/img/", "max-age=604800"); // cache for one week
-    server.serveStatic("/webfonts", LittleFS, "/webfonts/", "max-age=604800");
-    server.serveStatic("/manifest.json", LittleFS, "/manifest.json", "max-age=604800");
-    server.serveStatic("/", LittleFS, "/html/", "max-age=604800").setDefaultFile("index.html").setTemplateProcessor(staticProcessor);
-
-    server.begin();
-
-    LOG(INFO, ("Server started at " + WiFi.localIP().toString()).c_str());
+    DynamicJsonDocument doc(256 + message.length());
+    doc["type"] = F("log");
+    doc["command"] = F("log");
+    doc["level"] = levelToString(level);
+    doc["message"] = message;
+    notifyJson(doc);
 }
 
-// skip counter so we don't keep a value every second
-int skippedValues = 0;
-#define SECONDS_TO_SKIP 2
+} // namespace EmbeddedBle
 
-void sendTempEvent(double currentTemp, double targetTemp, double heaterPower) {
+inline bool bleIsConnected() {
+    return EmbeddedBle::g_clientConnected;
+}
+
+inline void setEepromWriteFcn(int (*fcnPtr)(void)) {
+    EmbeddedBle::g_writeToEeprom = fcnPtr;
+}
+
+inline void serverSetup() {
+    using namespace EmbeddedBle;
+
+    String deviceName = (hostname != nullptr && strlen(hostname) > 0) ? hostname : "CleverCoffee";
+
+    NimBLEDevice::init(deviceName.c_str());    NimBLEDevice::setMTU(247);
+
+    g_server = NimBLEDevice::createServer();
+    g_server->setCallbacks(new ServerCallbacks());
+
+    NimBLEService* service = g_server->createService(kServiceUuid);
+    g_txCharacteristic = service->createCharacteristic(kTxUuid, NIMBLE_PROPERTY::NOTIFY);
+    g_rxCharacteristic = service->createCharacteristic(kRxUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    g_rxCharacteristic->setCallbacks(new CommandCallbacks());
+
+    service->start();
+
+    NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+    advertising->addServiceUUID(service->getUUID());
+    advertising->setScanResponse(true);
+    advertising->start();
+
+    Logger::setSink([](Logger::Level level, const String& msg) {
+        EmbeddedBle::sendLogMessage(level, msg);
+    });
+}
+
+inline void sendTempEvent(double currentTemp, double targetTemp, double heaterPower) {
+    using namespace EmbeddedBle;
+
     curTemp = currentTemp;
     tTemp = targetTemp;
     hPower = heaterPower;
 
-    // save all values in memory to show history
     if (skippedValues > 0 && skippedValues % SECONDS_TO_SKIP == 0) {
-        // use array and int value for start index (round robin)
-        // one record (3 float values == 12 bytes) every three seconds, for half
-        // an hour -> 7.2kB of static memory
-        tempHistory[0][historyCurrentIndex] = (float)currentTemp;
-        tempHistory[1][historyCurrentIndex] = (float)targetTemp;
-        tempHistory[2][historyCurrentIndex] = (float)heaterPower;
+        tempHistory[0][historyCurrentIndex] = static_cast<float>(currentTemp);
+        tempHistory[1][historyCurrentIndex] = static_cast<float>(targetTemp);
+        tempHistory[2][historyCurrentIndex] = static_cast<float>(heaterPower);
         historyCurrentIndex = (historyCurrentIndex + 1) % HISTORY_LENGTH;
-        historyValueCount = min(HISTORY_LENGTH - 1, historyValueCount + 1);
+        historyValueCount = std::min(historyValueCount + 1, static_cast<int>(HISTORY_LENGTH - 1));
         skippedValues = 0;
     }
     else {
         skippedValues++;
     }
 
-    events.send("ping", NULL, millis());
-    events.send(getTempString().c_str(), "new_temps", millis());
+    if (!g_clientConnected || g_txCharacteristic == nullptr) {
+        return;
+    }
+
+    DynamicJsonDocument doc(256);
+    doc["type"] = F("telemetry");
+    doc["command"] = F("temperatures");
+    doc["current"] = round2(currentTemp);
+    doc["target"] = round2(targetTemp);
+    doc["power"] = round2(heaterPower);
+    notifyJson(doc);
 }
+

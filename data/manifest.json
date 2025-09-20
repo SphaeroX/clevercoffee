@@ -1,16 +1,17 @@
 {
-    "short_name": "Clever Coffee",
-    "name": "Clever Coffee",
+    "short_name": "CleverCoffee",
+    "name": "CleverCoffee Silvia",
     "icons": [
-      {
-        "src": "/img/logo.png",
-        "type": "image/png",
-        "sizes": "180x160"
-      }
+        {
+            "src": "/app/assets/logo.png",
+            "type": "image/png",
+            "sizes": "180x160"
+        }
     ],
-    "id": "/",
-    "start_url": "/",
+    "id": "/app/",
+    "start_url": "/app/index.html",
     "display": "standalone",
-    "scope": "/",
-    "theme_color": "#6C757D"
+    "scope": "/app/",
+    "theme_color": "#ff7a18",
+    "background_color": "#0f1115"
 }

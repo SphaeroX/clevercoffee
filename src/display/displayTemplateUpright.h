@@ -184,20 +184,16 @@ void printScreen() {
         // For status info
         u8g2.drawFrame(0, 0, 64, 12);
 
-        if (offlineMode == 0) {
-            getSignalStrength();
+        if (bleIsConnected()) {
+            u8g2.drawXBMP(4, 2, 8, 8, Antenna_OK_Icon);
 
-            if (WiFi.status() == WL_CONNECTED) {
-                u8g2.drawXBMP(4, 2, 8, 8, Antenna_OK_Icon);
-
-                for (int b = 0; b <= getSignalStrength(); b++) {
-                    u8g2.drawVLine(13 + (b * 2), 10 - (b * 2), b * 2);
-                }
+            for (int b = 0; b <= getSignalStrength(); b++) {
+                u8g2.drawVLine(13 + (b * 2), 10 - (b * 2), b * 2);
             }
-            else {
-                u8g2.setCursor(24, 2);
-                u8g2.print("");
-            }
+        }
+        else {
+            u8g2.setCursor(24, 2);
+            u8g2.print("BLE");
         }
     }
     else {

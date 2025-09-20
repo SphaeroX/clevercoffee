@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CleverCoffee Silvia</title>
+    <link rel="manifest" href="../manifest.json">
+    <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+    <header class="top-bar">
+        <div class="brand">
+            <span class="brand-title">CleverCoffee Silvia</span>
+            <span class="brand-sub">BLE Steuerung</span>
+        </div>
+        <button id="connectBtn" class="primary">Verbinden</button>
+    </header>
+
+    <main class="content" id="appRoot">
+        <section class="card" id="connectionCard">
+            <div class="card-header">
+                <h2>Status</h2>
+            </div>
+            <div class="card-body status">
+                <div class="status-row">
+                    <span class="label">Verbindung</span>
+                    <span class="value" id="connectionState">Getrennt</span>
+                </div>
+                <div class="status-row">
+                    <span class="label">Geraet</span>
+                    <span class="value" id="deviceName">-</span>
+                </div>
+                <div class="status-row">
+                    <span class="label">Firmware</span>
+                    <span class="value" id="firmwareInfo">unbekannt</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="card" id="telemetryCard">
+            <div class="card-header">
+                <h2>Temperaturen</h2>
+                <button id="refreshTelemetry" class="ghost" aria-label="Temperaturen aktualisieren">Auffrischen</button>
+            </div>
+            <div class="card-body telemetry">
+                <div class="metric">
+                    <span class="metric-label">Ist</span>
+                    <span class="metric-value" id="tempCurrent">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Ziel</span>
+                    <span class="metric-value" id="tempTarget">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Heizleistung</span>
+                    <span class="metric-value" id="tempPower">--</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="card" id="parametersCard">
+            <div class="card-header">
+                <h2>Parameter</h2>
+                <div class="actions">
+                    <button id="reloadParameters" class="ghost">Neu laden</button>
+                </div>
+            </div>
+            <div class="card-body" id="parameterContainer">
+                <p class="placeholder">Verbinde dich mit der Silvia, um Parameter zu laden.</p>
+            </div>
+        </section>
+
+        <section class="card" id="actionsCard">
+            <div class="card-header">
+                <h2>Aktionen</h2>
+            </div>
+            <div class="card-body actions">
+                <button id="toggleLogs" class="ghost">Logs anzeigen</button>
+                <button id="factoryReset" class="danger">Factory Reset</button>
+                <div class="log-level">
+                    <label for="logLevelSelect">Log-Level</label>
+                    <select id="logLevelSelect" disabled>
+                        <option value="TRACE">TRACE</option>
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO" selected>INFO</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="FATAL">FATAL</option>
+                    </select>
+                </div>
+            </div>
+        </section>
+
+        <section class="card hidden" id="logsCard">
+            <div class="card-header">
+                <h2>Logs</h2>
+                <button id="clearLogs" class="ghost">Leeren</button>
+            </div>
+            <div class="card-body logs" id="logContainer"></div>
+        </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+
+    <template id="parameterRowTemplate">
+        <div class="parameter-row">
+            <div class="parameter-info">
+                <span class="parameter-label"></span>
+                <span class="parameter-name"></span>
+            </div>
+            <div class="parameter-control"></div>
+            <div class="parameter-meta">
+                <button class="help ghost" type="button">Info</button>
+                <span class="range"></span>
+            </div>
+            <div class="help-text hidden"></div>
+            <div class="error-text hidden"></div>
+        </div>
+    </template>
+
+    <script src="./main.js" type="module"></script>
+</body>
+</html>

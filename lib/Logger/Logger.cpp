@@ -1,10 +1,10 @@
-#include <WiFi.h>
-#include <utility>
-
 #include "Logger.h"
 
+#include <stdarg.h>
+#include <utility>
+
 Logger::Logger(const uint16_t port) :
-    port_(port), server_(port) {
+    port_(port) {
 }
 
 Logger& Logger::getInstanceImpl(const uint16_t port) {
@@ -17,84 +17,61 @@ void Logger::init(const uint16_t port) {
 }
 
 bool Logger::begin() {
-    if (WiFi.status() == WL_CONNECTED) {
-        Logger::getInstance().server_.begin();
-    }
-
-    // If the serial interface has not been started, start it now:
     if (!Serial) {
         Serial.begin(115200);
     }
+
     return true;
 }
 
 bool Logger::update() {
-    if (Logger::getInstance().server_.hasClient()) {
-        // If we are already connected to another client, then reject the new connection, otherwise accept the connection.
-        if (Logger::getInstance().client_.connected()) {
-            LOG(WARNING, "Serial Server Connection rejected");
-            Logger::getInstance().server_.available().stop();
-        }
-        else {
-            LOG(INFO, "Serial Server Connection accepted");
-            Logger::getInstance().client_ = Logger::getInstance().server_.available();
-        }
-    }
     return true;
 }
 
 uint16_t Logger::getPort() {
-    return Logger::getInstance().getPort();
+    return Logger::getInstance().port_;
+}
+
+void Logger::setSink(LogSink sink) {
+    Logger::getInstance().sink_ = std::move(sink);
 }
 
 void Logger::log(const Level level, const String& file, const __FlashStringHelper* function, uint32_t line, const char* logmsg) {
     char time[12];
     current_time(time);
 
-    if (WiFi.status() == WL_CONNECTED && client_.connected()) {
-        client_.print(time);
-        client_.print(get_level_identifier(level).c_str());
-        client_.print(" ");
-        if (level < Level::DEBUG) {
-            client_.print(file.c_str());
-            client_.print(":");
-            client_.print(line);
-            client_.print("@");
-            client_.print(function);
-            client_.print("() ");
-        }
-        client_.print(logmsg);
-        client_.print("\n");
+    String message;
+    message.reserve(160);
+    message += time;
+    message += get_level_identifier(level);
+    message += ' ';
+
+    if (level < Level::DEBUG) {
+        message += file;
+        message += ':';
+        message += line;
+        message += '@';
+        message += function;
+        message += F("() ");
     }
-    else {
-        Serial.print(time);
-        Serial.print(get_level_identifier(level).c_str());
-        Serial.print(" ");
-        if (level < Level::DEBUG) {
-            Serial.print(file.c_str());
-            Serial.print(":");
-            Serial.print(line);
-            Serial.print("@");
-            Serial.print(function);
-            Serial.print("() ");
-        }
-        Serial.print(logmsg);
-        Serial.print("\n");
+
+    message += logmsg;
+
+    Serial.println(message);
+
+    if (sink_) {
+        sink_(level, message);
     }
 }
 
 void Logger::logf(const Level level, const String& file, const __FlashStringHelper* function, uint32_t line, const char* format, ...) {
-    // reimplement printf method so that we can take dynamic list of parameters as printf does
-    // (we can't simply pass these on to existing printf methods it seems)
-
     va_list arg;
     va_start(arg, format);
-    char temp[64]; // allocate a temp buffer
+    char temp[64];
     char* buffer = temp;
     size_t len = vsnprintf(temp, sizeof(temp), format, arg);
     va_end(arg);
 
-    // if temp buffer was too short, create new one with enough room (includes previous bytes)
     if (len > sizeof(temp) - 1) {
         buffer = new char[len + 1];
 

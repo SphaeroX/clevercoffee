@@ -338,32 +338,7 @@ bool mqtt_was_connected = false;
  * @brief Get Wifi signal strength and set signalBars for display
  */
 int getSignalStrength() {
-    if (offlineMode == 1) return 0;
-
-    long rssi;
-
-    if (WiFi.status() == WL_CONNECTED) {
-        rssi = WiFi.RSSI();
-    }
-    else {
-        rssi = -100;
-    }
-
-    if (rssi >= -50) {
-        return 4;
-    }
-    else if (rssi < -50 && rssi >= -65) {
-        return 3;
-    }
-    else if (rssi < -65 && rssi >= -75) {
-        return 2;
-    }
-    else if (rssi < -75 && rssi >= -80) {
-        return 1;
-    }
-    else {
-        return 0;
-    }
+    return bleIsConnected() ? 4 : 0;
 }
 
 // Display define & template
