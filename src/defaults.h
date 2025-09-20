@@ -32,6 +32,8 @@ int writeSysParamsToStorage(void);
 #define AGGIMAX                               55     // PID Integrator Max (regular phase)
 #define STARTKP                               45     // PID Kp (coldstart phase)
 #define STARTTN                               130    // PID Tn (coldstart phase)
+#define STARTTV                               8.0    // PID Tv (coldstart phase)
+#define STARTIMAX                             80     // PID Integrator Max (coldstart phase)
 #define STEAMKP                               150    // PID kp (steam phase)
 #define AGGBKP                                50     // PID Kp (brew detection phase)
 #define AGGBTN                                0      // PID Tn (brew detection phase)
@@ -52,6 +54,23 @@ int writeSysParamsToStorage(void);
 #define FEATURE_FULLSCREEN_MANUAL_FLUSH_TIMER 0      // enables full screen manual flush timer
 #define POST_BREW_TIMER_DURATION              3      // time in seconds that brew timer will be shown after brew finished
 #define FEATURE_HEATING_LOGO                  1      // enables full screen logo if mashine is heating
+#define WARMUP_BOOST_DELTA                     6.0    // Temperature delta in degC to stay in warmup boost phase
+#define STABILIZATION_BAND                     0.4    // Temperature band in degC for brew-ready detection
+#define STABILITY_RATE_THRESHOLD               0.05   // Absolute temperature rate in degC/s to treat as stable
+#define STABILITY_HOLD_TIME                    45000  // Time in ms inside the band before brew-ready is declared
+#define TEMP_RATE_FILTER_ALPHA                 0.25   // Low-pass filter factor for temperature rate (0..1)
+#define WARMUP_LEAD_SECONDS                    3.0    // Feed-forward horizon while heating up
+#define BREW_COOLING_LEAD_SECONDS              1.8    // Feed-forward horizon while cooling during brew
+#define CONTROL_MAX_COMPENSATION               4.0    // Maximum compensation added to the sensor value for PID control
+#define HEATER_BASELINE_ALPHA                  0.05   // Exponential filter for heater baseline estimation
+#define HEATER_BASELINE_TEMP_BAND              0.5    // Allowed temperature deviation in degC to update heater baseline
+#define HEATER_BASELINE_TIMEOUT                180000 // Timeout in ms before the heater baseline is invalidated
+#define BREW_HOLD_FACTOR                       0.85   // Fraction of baseline heater output during brew hold
+#define BREW_HOLD_MIN_OUTPUT                   120    // Minimum manual heater output (0-1000 range) during brew hold
+#define BREW_HOLD_MAX_OUTPUT                   700    // Maximum manual heater output (0-1000 range) during brew hold
+#define BREW_HOLD_GAIN                         220    // Gain applied to temperature delta for brew hold correction
+#define BREW_HOLD_MAX_DELTA                    200    // Maximum additional correction (0-1000 scale) for brew hold
+
 #define FEATURE_PID_OFF_LOGO                  1      // enables full screen logo if pid is switched off
 
 #define PID_KP_REGULAR_MIN           0

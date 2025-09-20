@@ -14,6 +14,7 @@
 
 // STL includes
 #include <map>
+#include <cmath>
 
 // Libraries & Dependencies
 #include "Logger.h"
@@ -90,9 +91,16 @@ enum MachineState {
     kEepromError = 110,
 };
 
+enum class ThermalStage {
+    kHeatupBoost,
+    kStabilizing,
+    kBrewReady,
+    kBrewActive,
+    kSteam
+};
+
 MachineState machineState = kInit;
 MachineState lastmachinestate = kInit;
-int lastmachinestatepid = -1;
 
 // Definitions below must be changed in the userConfig.h file
 int connectmode = CONNECTMODE;
@@ -162,8 +170,11 @@ void setPidStatus(int pidStatus);
 void setBackflush(int backflush);
 void setScaleTare(int tare);
 void setScaleCalibration(int tare);
-void setPIDTunings(bool usePonM);
-void setBDPIDTunings();
+void setPIDTunings(bool usePonM, const char* context = nullptr);
+void setBDPIDTunings(const char* context = nullptr);
+void setStartPIDTunings();
+void applySteamTunings(const char* context = nullptr);
+void logPidStage(ThermalStage stage, double kp, double ki, double kd, const char* label = nullptr);
 void loopcalibrate();
 void looppid();
 void loopLED();
@@ -179,6 +190,14 @@ int writeSysParamsToMQTT(bool continueOnError);
 void updateStandbyTimer(void);
 void resetStandbyTimer(void);
 void wiFiReset(void);
+double updateTemperatureRate(double currentTemp);
+double computeControlTemperature(double measuredTemp, double rate);
+void updateThermalStage(MachineState state, double delta, double rate, unsigned long now);
+const char* thermalStageToString(ThermalStage stage);
+void applyThermalStageTunings(bool force = false);
+double computeBrewHoldOutput(double delta);
+void updateHeaterBaseline(unsigned long now, double delta, double rate);
+void resetHeaterBaseline();
 
 // system parameters
 uint8_t pidON = 0;   // 1 = control loop in closed loop
@@ -220,25 +239,41 @@ double standbyModeTime = STANDBY_MODE_TIME;
 #include "standby.h"
 
 // Variables to hold PID values (Temp input, Heater output)
-double temperature, pidOutput;
+double temperature = 0;
+double controlTemperature = 0;
+double rawTemperature = 0;
+double pidOutput;
 int steamON = 0;
 int steamFirstON = 0;
 
-#if startTn == 0
-double startKi = 0;
-#else
-double startKi = startKp / startTn;
-#endif
+double startKp = STARTKP;
+double startTn = STARTTN;
+double startTv = STARTTV;
+double startIMax = STARTIMAX;
+double startKi = (startTn != 0) ? startKp / startTn : 0;
+double startKd = startTv * startKp;
 
-#if aggTn == 0
-double aggKi = 0;
-#else
-double aggKi = aggKp / aggTn;
-#endif
-
+double aggKi = (aggTn != 0) ? aggKp / aggTn : 0;
 double aggKd = aggTv * aggKp;
 
-PID bPID(&temperature, &pidOutput, &setpoint, aggKp, aggKi, aggKd, 1, DIRECT);
+double filteredTempRate = 0;
+double temperatureRate = 0;
+double previousTempForRate = 0;
+unsigned long lastRateMillis = 0;
+
+double heaterBaselineOutput = 0;
+bool heaterBaselineValid = false;
+unsigned long lastBaselineUpdate = 0;
+
+ThermalStage thermalStage = ThermalStage::kHeatupBoost;
+ThermalStage lastStageForTunings = ThermalStage::kHeatupBoost;
+ThermalStage lastLoggedThermalStage = ThermalStage::kHeatupBoost;
+double lastLoggedKp = -1;
+double lastLoggedKi = -1;
+double lastLoggedKd = -1;
+unsigned long stageEntryMillis = 0;
+
+PID bPID(&controlTemperature, &pidOutput, &setpoint, aggKp, aggKi, aggKd, 1, DIRECT);
 
 #include "brewHandler.h"
 
@@ -1550,7 +1585,7 @@ void looppid() {
 #endif
                 mqtt_was_connected = true;
             }
-            // Supress debug messages until we have a connection etablished
+            // Supress debug messages until we have a connection established
             else if (mqtt_was_connected) {
                 LOG(INFO, "MQTT disconnected");
                 mqtt_was_connected = false;
@@ -1576,39 +1611,62 @@ void looppid() {
         checkWifi();
     }
 
-    // Update the temperature:
-    temperature = tempSensor->getCurrentTemperature();
+    double sensorTemperature = tempSensor->getCurrentTemperature();
 
-    if (machineState != kSteam) {
-        temperature -= brewTempOffset;
+    checkSteamSwitch();
+    checkPowerSwitch();
+
+    if (steamON == 0 && machineState != kSteam) {
+        sensorTemperature -= brewTempOffset;
     }
 
-    testEmergencyStop(); // test if temp is too high
-    bPID.Compute();      // the variable pidOutput now has new values from PID (will be written to heater pin in ISR.cpp)
+    rawTemperature = sensorTemperature;
+    temperature = rawTemperature;
+
+    temperatureRate = updateTemperatureRate(rawTemperature);
+
+    setpoint = (steamON == 1) ? steamSetpoint : brewSetpoint;
+
+    testEmergencyStop();
+
+    unsigned long now = millis();
+    double delta = setpoint - rawTemperature;
+
+    updateStandbyTimer();
+    handleMachineState();
+
+#if (FEATURE_BREWSWITCH == 1)
+    shouldDisplayBrewTimer();
+#endif
+
+#if OLED_DISPLAY != 0
+    printDisplayTimer();
+#endif
+
+    updateThermalStage(machineState, delta, temperatureRate, now);
+
+    controlTemperature = computeControlTemperature(rawTemperature, temperatureRate);
+
+    applyThermalStageTunings();
+
+    bPID.Compute();
 
     if ((millis() - lastTempEvent) > tempEventInterval) {
-        // send temperatures to website endpoint
         sendTempEvent(temperature, brewSetpoint, pidOutput / 10); // pidOutput is promill, so /10 to get percent value
         lastTempEvent = millis();
 
         if (pidON) {
             LOGF(TRACE, "Current PID mode: %s", bPID.GetPonE() ? "PonE" : "PonM");
 
-            // P-Part
             LOGF(TRACE, "Current PID input error: %f", bPID.GetInputError());
             LOGF(TRACE, "Current PID P part: %f", bPID.GetLastPPart());
             LOGF(TRACE, "Current PID kP: %f", bPID.GetKp());
-            // I-Part
             LOGF(TRACE, "Current PID I sum: %f", bPID.GetLastIPart());
             LOGF(TRACE, "Current PID kI: %f", bPID.GetKi());
-            // D-Part
             LOGF(TRACE, "Current PID diff'd input: %f", bPID.GetDeltaInput());
             LOGF(TRACE, "Current PID D part: %f", bPID.GetLastDPart());
-            LOGF(TRACE, "Current PID kD: %f", bPID.GetKd());
-            // Combined PID output
             LOGF(TRACE, "Current PID Output: %f", pidOutput);
             LOGF(TRACE, "Current Machinestate: %s", machinestateEnumToString(machineState));
-            // Brew
             LOGF(TRACE, "currBrewTime %f", currBrewTime);
             LOGF(TRACE, "Brew detected %i", brew());
             LOGF(TRACE, "brewPIDdisabled %i", brewPIDDisabled);
@@ -1630,94 +1688,46 @@ void looppid() {
     }
 #endif
 
-    checkSteamSwitch();
-    checkPowerSwitch();
+    bool pidShouldBeOff = (pidON == 0) || machineState == kPidDisabled || machineState == kWaterTankEmpty || machineState == kSensorError || machineState == kEmergencyStop ||
+                          machineState == kEepromError || machineState == kStandby || machineState == kBackflush;
 
-    // set setpoint depending on steam or brew mode
-    if (steamON == 1) {
-        setpoint = steamSetpoint;
-    }
-    else if (steamON == 0) {
-        setpoint = brewSetpoint;
-    }
-
-    updateStandbyTimer();
-    handleMachineState();
-
-    // Check if brew timer should be shown
-#if (FEATURE_BREWSWITCH == 1)
-    shouldDisplayBrewTimer();
-#endif
-
-    // Check if PID should run or not. If not, set to manual and force output to zero
-#if OLED_DISPLAY != 0
-    printDisplayTimer();
-#endif
-
-    if (machineState == kPidDisabled || machineState == kWaterTankEmpty || machineState == kSensorError || machineState == kEmergencyStop || machineState == kEepromError || machineState == kStandby ||
-        machineState == kBackflush || brewPIDDisabled) {
-        if (bPID.GetMode() == 1) {
-            // Force PID shutdown
-            bPID.SetMode(0);
+    if (pidShouldBeOff) {
+        if (bPID.GetMode() == AUTOMATIC) {
+            bPID.SetMode(MANUAL);
             pidOutput = 0;
             heaterRelay.off();
         }
+        resetHeaterBaseline();
     }
-    else { // no sensorerror, no pid off or no Emergency Stop
-        if (bPID.GetMode() == 0) {
-            bPID.SetMode(1);
-        }
-    }
-
-    // Regular PID operation
-    if (machineState == kPidNormal) {
-        setPIDTunings(usePonM);
+    else if (!brewPIDDisabled && bPID.GetMode() == MANUAL) {
+        bPID.SetMode(AUTOMATIC);
+        applyThermalStageTunings(true);
     }
 
-    // Brew PID
-    if (machineState == kBrew) {
-        if (brewPIDDelay > 0 && currBrewTime > 0 && currBrewTime < brewPIDDelay * 1000) {
-            // disable PID for brewPIDDelay seconds, enable PID again with new tunings after that
-            if (!brewPIDDisabled) {
-                brewPIDDisabled = true;
-                bPID.SetMode(MANUAL);
-                pidOutput = 0;
-                heaterRelay.off();
-                LOGF(DEBUG, "disabled PID, waiting for %.0f seconds before enabling PID again", brewPIDDelay);
-            }
-        }
-        else {
-            if (brewPIDDisabled) {
-                // enable PID again
-                bPID.SetMode(AUTOMATIC);
-                brewPIDDisabled = false;
-                LOG(DEBUG, "Enabled PID again after delay");
-            }
+    bool brewDelayActive = machineState == kBrew && brewPIDDelay > 0 && currBrewTime > 0 && currBrewTime < brewPIDDelay * 1000;
 
-            if (useBDPID) {
-                setBDPIDTunings();
-            }
-            else {
-                setPIDTunings(usePonM);
-            }
+    if (machineState == kBrew && brewDelayActive) {
+        if (!brewPIDDisabled) {
+            brewPIDDisabled = true;
+            bPID.SetMode(MANUAL);
+            LOGF(DEBUG, "Manual brew hold for %.0f seconds", brewPIDDelay);
         }
+        pidOutput = computeBrewHoldOutput(delta);
     }
-    // Reset brewPIDdisabled if brew was aborted
-    if (machineState != kBrew && brewPIDDisabled) {
-        // enable PID again
+    else if (brewPIDDisabled) {
         bPID.SetMode(AUTOMATIC);
         brewPIDDisabled = false;
-        LOG(DEBUG, "Enabled PID again after brew was manually stopped");
+        applyThermalStageTunings(true);
+        if (machineState == kBrew) {
+            LOG(DEBUG, "Re-enabled PID after manual brew hold");
+        }
+        else {
+            LOG(DEBUG, "Enabled PID again after brew was manually stopped");
+        }
     }
 
-    // Steam on
-    if (machineState == kSteam) {
-        if (lastmachinestatepid != machineState) {
-            LOGF(DEBUG, "new PID-Values: P=%.1f  I=%.1f  D=%.1f", 150.0, 0.0, 0.0);
-            lastmachinestatepid = machineState;
-        }
-
-        bPID.SetTunings(steamKp, 0, 0, 1);
+    if (!brewPIDDisabled) {
+        updateHeaterBaseline(now, delta, temperatureRate);
     }
 }
 
@@ -1785,50 +1795,262 @@ void setPidStatus(int pidStatus) {
     writeSysParamsToStorage();
 }
 
-void setPIDTunings(bool usePonM) {
-    // Prevent overwriting of brewdetection values
-    // calc ki, kd
-    if (aggTn != 0) {
-        aggKi = aggKp / aggTn;
-    }
-    else {
-        aggKi = 0;
-    }
-
+void setPIDTunings(bool usePonM, const char* context) {
+    aggKi = (aggTn != 0) ? aggKp / aggTn : 0;
     aggKd = aggTv * aggKp;
-
     bPID.SetIntegratorLimits(0, aggIMax);
 
-    if (lastmachinestatepid != machineState) {
-        LOGF(DEBUG, "new PID-Values: P=%.1f  I=%.1f  D=%.1f", aggKp, aggKi, aggKd);
-        lastmachinestatepid = machineState;
-    }
-
     if (usePonM) {
+        aggbKi = (aggbTn != 0) ? aggbKp / aggbTn : 0;
+        aggbKd = aggbTv * aggbKp;
         bPID.SetTunings(aggbKp, aggbKi, aggbKd, P_ON_M);
+        logPidStage(thermalStage, aggbKp, aggbKi, aggbKd, (context != nullptr) ? context : "pid-ponm");
     }
     else {
         bPID.SetTunings(aggKp, aggKi, aggKd, 1);
+        logPidStage(thermalStage, aggKp, aggKi, aggKd, context);
     }
 }
 
-void setBDPIDTunings() {
-    // calc ki, kd
-    if (aggbTn != 0) {
-        aggbKi = aggbKp / aggbTn;
+void setBDPIDTunings(const char* context) {
+    aggbKi = (aggbTn != 0) ? aggbKp / aggbTn : 0;
+    aggbKd = aggbTv * aggbKp;
+    bPID.SetIntegratorLimits(0, aggIMax);
+    bPID.SetTunings(aggbKp, aggbKi, aggbKd, 1);
+    logPidStage(thermalStage, aggbKp, aggbKi, aggbKd, (context != nullptr) ? context : "brew-detection");
+}
+
+template <typename T>
+static inline T clampValue(T value, T minValue, T maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
+const char* thermalStageToString(ThermalStage stage) {
+    switch (stage) {
+        case ThermalStage::kHeatupBoost:
+            return "warmup";
+        case ThermalStage::kStabilizing:
+            return "stabilizing";
+        case ThermalStage::kBrewReady:
+            return "brew-ready";
+        case ThermalStage::kBrewActive:
+            return "brew-active";
+        case ThermalStage::kSteam:
+            return "steam";
+        default:
+            return "unknown";
+    }
+}
+
+void logPidStage(ThermalStage stage, double kp, double ki, double kd, const char* label) {
+    bool stageChanged = stage != lastLoggedThermalStage;
+    bool valuesChanged = fabs(kp - lastLoggedKp) > 0.01 || fabs(ki - lastLoggedKi) > 0.01 || fabs(kd - lastLoggedKd) > 0.01;
+    if (!stageChanged && !valuesChanged) {
+        return;
+    }
+
+    const char* stageLabel = (label != nullptr) ? label : thermalStageToString(stage);
+    LOGF(DEBUG, "PID stage %s -> P=%.2f I=%.2f D=%.2f", stageLabel, kp, ki, kd);
+
+    lastLoggedThermalStage = stage;
+    lastLoggedKp = kp;
+    lastLoggedKi = ki;
+    lastLoggedKd = kd;
+}
+
+double updateTemperatureRate(double currentTemp) {
+    unsigned long now = millis();
+    if (lastRateMillis == 0) {
+        lastRateMillis = now;
+        previousTempForRate = currentTemp;
+        return filteredTempRate;
+    }
+
+    unsigned long elapsed = now - lastRateMillis;
+    if (elapsed < 50) {
+        return filteredTempRate;
+    }
+
+    double dt = static_cast<double>(elapsed) / 1000.0;
+    double instantaneous = (currentTemp - previousTempForRate) / dt;
+    double alpha = clampValue(static_cast<double>(TEMP_RATE_FILTER_ALPHA), 0.0, 1.0);
+
+    filteredTempRate = filteredTempRate + alpha * (instantaneous - filteredTempRate);
+
+    previousTempForRate = currentTemp;
+    lastRateMillis = now;
+    return filteredTempRate;
+}
+
+double computeControlTemperature(double measuredTemp, double rate) {
+    double compensation = 0;
+
+    if ((thermalStage == ThermalStage::kHeatupBoost || thermalStage == ThermalStage::kStabilizing) && rate > 0) {
+        compensation = clampValue(rate * WARMUP_LEAD_SECONDS, -CONTROL_MAX_COMPENSATION, CONTROL_MAX_COMPENSATION);
+    }
+    else if (thermalStage == ThermalStage::kBrewActive && rate < 0) {
+        compensation = clampValue(rate * BREW_COOLING_LEAD_SECONDS, -CONTROL_MAX_COMPENSATION, CONTROL_MAX_COMPENSATION);
+    }
+
+    return measuredTemp + compensation;
+}
+
+void updateThermalStage(MachineState state, double delta, double rate, unsigned long now) {
+    ThermalStage newStage = thermalStage;
+
+    if (pidON == 0 || state == kPidDisabled || state == kStandby || state == kEmergencyStop || state == kSensorError || state == kWaterTankEmpty || state == kEepromError ||
+        state == kBackflush) {
+        newStage = ThermalStage::kHeatupBoost;
+        stageEntryMillis = 0;
+    }
+    else if (steamON == 1 || state == kSteam) {
+        newStage = ThermalStage::kSteam;
+        stageEntryMillis = 0;
+    }
+    else if (state == kBrew) {
+        newStage = ThermalStage::kBrewActive;
+        stageEntryMillis = 0;
     }
     else {
-        aggbKi = 0;
+        double absDelta = fabs(delta);
+        double absRate = fabs(rate);
+
+        if (absDelta > WARMUP_BOOST_DELTA) {
+            newStage = ThermalStage::kHeatupBoost;
+            stageEntryMillis = 0;
+        }
+        else {
+            if (absDelta <= STABILIZATION_BAND && absRate <= STABILITY_RATE_THRESHOLD) {
+                if (stageEntryMillis == 0 || thermalStage != ThermalStage::kStabilizing) {
+                    stageEntryMillis = now;
+                }
+
+                if ((now - stageEntryMillis) >= STABILITY_HOLD_TIME) {
+                    newStage = ThermalStage::kBrewReady;
+                }
+                else {
+                    newStage = ThermalStage::kStabilizing;
+                }
+            }
+            else {
+                stageEntryMillis = now;
+                newStage = ThermalStage::kStabilizing;
+            }
+        }
     }
 
-    aggbKd = aggbTv * aggbKp;
+    if (newStage != thermalStage) {
+        thermalStage = newStage;
+        if (newStage != ThermalStage::kStabilizing && newStage != ThermalStage::kBrewReady) {
+            stageEntryMillis = 0;
+        }
+        LOGF(DEBUG, "Thermal stage changed to %s", thermalStageToString(newStage));
+    }
+}
 
-    if (lastmachinestatepid != machineState) {
-        LOGF(DEBUG, "new PID-Values: P=%.1f  I=%.1f  D=%.1f", aggbKp, aggbKi, aggbKd);
-        lastmachinestatepid = machineState;
+void setStartPIDTunings() {
+    bPID.SetIntegratorLimits(0, startIMax);
+    bPID.SetTunings(startKp, startKi, startKd, P_ON_M);
+    logPidStage(ThermalStage::kHeatupBoost, startKp, startKi, startKd, "warmup");
+}
+
+void applySteamTunings(const char* context) {
+    bPID.SetIntegratorLimits(0, aggIMax);
+    bPID.SetTunings(steamKp, 0, 0, 1);
+    logPidStage(ThermalStage::kSteam, steamKp, 0, 0, (context != nullptr) ? context : "steam");
+}
+
+void applyThermalStageTunings(bool force) {
+    static bool lastUsePonM = false;
+    static bool lastUseBD = false;
+
+    bool stageChanged = thermalStage != lastStageForTunings;
+    bool usePonMChanged = usePonM != lastUsePonM;
+    bool useBDChanged = useBDPID != lastUseBD;
+    bool shouldUpdate = force || stageChanged || usePonMChanged || useBDChanged || thermalStage == ThermalStage::kBrewActive;
+
+    if (!shouldUpdate) {
+        return;
     }
 
-    bPID.SetTunings(aggbKp, aggbKi, aggbKd, 1);
+    switch (thermalStage) {
+        case ThermalStage::kHeatupBoost:
+            setStartPIDTunings();
+            break;
+        case ThermalStage::kStabilizing:
+            setPIDTunings(usePonM, "stabilizing");
+            break;
+        case ThermalStage::kBrewReady:
+            setPIDTunings(usePonM, "brew-ready");
+            break;
+        case ThermalStage::kBrewActive:
+            if (!brewPIDDisabled) {
+                if (useBDPID) {
+                    setBDPIDTunings("brew-active");
+                }
+                else {
+                    setPIDTunings(usePonM, "brew-active");
+                }
+            }
+            break;
+        case ThermalStage::kSteam:
+            applySteamTunings("steam");
+            break;
+    }
+
+    lastStageForTunings = thermalStage;
+    lastUsePonM = usePonM;
+    lastUseBD = useBDPID;
+}
+
+double computeBrewHoldOutput(double delta) {
+    double manualOutput = heaterBaselineValid ? heaterBaselineOutput * BREW_HOLD_FACTOR : static_cast<double>(BREW_HOLD_MIN_OUTPUT);
+    double correction = clampValue(delta * BREW_HOLD_GAIN, -static_cast<double>(BREW_HOLD_MAX_DELTA), static_cast<double>(BREW_HOLD_MAX_DELTA));
+    manualOutput = clampValue(manualOutput + correction, static_cast<double>(BREW_HOLD_MIN_OUTPUT), static_cast<double>(BREW_HOLD_MAX_OUTPUT));
+    return manualOutput;
+}
+
+void updateHeaterBaseline(unsigned long now, double delta, double rate) {
+    if (bPID.GetMode() != AUTOMATIC || !pidON) {
+        if (heaterBaselineValid && (now - lastBaselineUpdate) > HEATER_BASELINE_TIMEOUT) {
+            heaterBaselineValid = false;
+            heaterBaselineOutput = 0;
+        }
+        return;
+    }
+
+    if (machineState != kPidNormal) {
+        if (heaterBaselineValid && (now - lastBaselineUpdate) > HEATER_BASELINE_TIMEOUT) {
+            heaterBaselineValid = false;
+            heaterBaselineOutput = 0;
+        }
+        return;
+    }
+
+    double absDelta = fabs(delta);
+    double absRate = fabs(rate);
+
+    if (absDelta <= HEATER_BASELINE_TEMP_BAND && absRate <= STABILITY_RATE_THRESHOLD) {
+        double alpha = clampValue(static_cast<double>(HEATER_BASELINE_ALPHA), 0.0, 1.0);
+        heaterBaselineOutput = (1.0 - alpha) * heaterBaselineOutput + alpha * pidOutput;
+        heaterBaselineValid = true;
+        lastBaselineUpdate = now;
+    }
+    else if (heaterBaselineValid && (now - lastBaselineUpdate) > HEATER_BASELINE_TIMEOUT) {
+        heaterBaselineValid = false;
+        heaterBaselineOutput = 0;
+    }
+}
+
+void resetHeaterBaseline() {
+    heaterBaselineValid = false;
+    heaterBaselineOutput = 0;
 }
 
 /**

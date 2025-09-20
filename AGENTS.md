@@ -32,6 +32,7 @@
 - PID-Brew-Parameter (`DEFAULT_KP_BREW`, `DEFAULT_KI_BREW`, `DEFAULT_KD_BREW`) dokumentieren und testen.
 - Preinfusion- und Brew-by-Weight-Profile in `brewHandler.h` klar kommentieren.
 - Secrets (WLAN, OTA) ausschliesslich ueber `platformio_extra.ini` oder dynamische Generierung (z.B. `data/manifest.json`).
+- Neue Thermalkontroll-Parameter in `defaults.h` (`WARMUP_BOOST_DELTA`, `STABILITY_*`, `BREW_HOLD_*`) steuern Feedforward, Stage-Switching und Brew-Hold-Leistung; bei Profilanpassungen mit dokumentieren.
 
 ## Build- und Release-Workflow
 - Standard-Builds gegen `env:esp32_usb` fahren.
